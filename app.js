@@ -192,8 +192,15 @@ const drive = {
     await drive.upload('db.json.enc', root, payload, 'application/octet-stream');
     // 3) 画像（未アップロード分のみ・平文）
     const orig = await drive.folder('原本', root);
-    let n = 0;
+    let n = 0, d = 0;
     for (const r of receipts) {
+      if (r.status === 'void') {
+        if (r.pendingDriveDelete && r.driveFileId) {
+          try { await drive.api(`https://www.googleapis.com/drive/v3/files/${r.driveFileId}`, { method: 'DELETE' }); } catch (e) { if (!String(e).includes('404')) throw e; }
+          r.driveFileId = null; r.pendingDriveDelete = false; await putReceipt(r); d++;
+        }
+        continue;
+      }
       if (r.driveFileId) continue;
       const img = await idb.get('images', r.id); if (!img) continue;
       const ym = (r.txn_date || r.captured_utc).slice(0, 7);
@@ -202,7 +209,7 @@ const drive = {
       r.driveFileId = j.id; await putReceipt(r); n++;
     }
     state.settings.lastSync = new Date().toISOString(); await saveSettings();
-    return n;
+    return { n, d };
   },
   async restore() {
     const root = await drive.folder(CFG.DRIVE_FOLDER_NAME);
@@ -254,6 +261,7 @@ async function handleFiles(files) {
         r.ai_json = j; r.txn_date = j.txn_date; r.merchant_raw = j.merchant; r.amount = j.amount; r.currency = j.currency || 'JPY';
         r.tax_rate = j.tax_rate; r.category = (j.category_suggestion || {}).code; r.confidence = Math.min(...Object.values(j.fields_confidence || { x: 0 }));
         if (j.entity_suggestion) r.entity = j.entity_suggestion;
+        const card = state.settings.cards.find(c => c.last4 && j.card_last4 === c.last4); if (card) r.card_id = card.id;
         const known = state.settings.rules[normMerchant(j.merchant_normalized || j.merchant)]; if (known) r.category = known;
       } catch (e) { r.error = String(e.message); }
     } else { r.status = 'provisional'; }
@@ -274,11 +282,15 @@ async function renderHome() {
   $('#st-lic').textContent = state.lic && state.lic.ok ? `ライセンス ${state.lic.plan}${state.lic.grace ? '（猶予中）' : ''}` : 'ライセンス: ' + (state.lic ? state.lic.reason : '未確認');
   $('#st-lic').className = state.lic && state.lic.ok ? 'on' : 'ng';
   $('#st-drive').textContent = drive.token() ? 'Drive接続中' : 'Drive未接続'; $('#st-drive').className = drive.token() ? 'on' : 'off';
-  const rs = (await getReceipts()).filter(r => (r.txn_date || r.captured_utc).startsWith(ym) && r.status !== 'void');
-  const sum = e => rs.filter(r => r.entity === e).reduce((a, r) => a + (r.currency === 'JPY' ? +r.amount || 0 : +r.amount_jpy || 0), 0);
-  $('#tot-company').textContent = yen(sum('company')); $('#tot-private').textContent = yen(sum('private'));
-  const pend = rs.filter(r => r.status !== 'confirmed').length;
-  $('#pending-note').textContent = pend ? `未確認 ${pend} 件（一覧から開けます）` : '';
+  const all = (await getReceipts()).filter(r => r.status !== 'void');
+  const prev = new Date(); prev.setDate(1); prev.setMonth(prev.getMonth() - 1); const pym = prev.toISOString().slice(0, 7);
+  const inMonth = (r, m) => (r.txn_date || r.captured_utc).startsWith(m);
+  const amt = r => r.currency === 'JPY' ? +r.amount || 0 : +r.amount_jpy || 0;
+  const sum = (e, m) => all.filter(r => r.entity === e && inMonth(r, m)).reduce((a, r) => a + amt(r), 0);
+  $('#tot-company').textContent = yen(sum('company', ym)); $('#tot-private').textContent = yen(sum('private', ym));
+  const pend = all.filter(r => r.status !== 'confirmed').length;
+  const prevTotal = sum('company', pym) + sum('private', pym);
+  $('#pending-note').textContent = [prevTotal ? `前月（${pym.replace('-', '年')}月）合計 ${yen(prevTotal)}` : '', pend ? `未確認 ${pend} 件（一覧から開けます）` : ''].filter(Boolean).join(' ／ ');
   $('#btn-shoot').disabled = !(state.lic && state.lic.ok);
 }
 
@@ -387,13 +399,20 @@ async function main() {
   $('#file').onchange = async e => { const fs = [...e.target.files]; e.target.value = ''; msg('#home-msg', `${fs.length} 枚を処理中…`, 'ok'); await handleFiles(fs); msg('#home-msg', ''); };
   $('#seg-company').onclick = () => setEntity('company'); $('#seg-private').onclick = () => setEntity('private');
   $('#btn-save').onclick = saveReview;
-  $('#btn-discard').onclick = async () => { const r = state.cur; r.status = 'void'; await logHistory(r.id, 'status', 'pending', 'void', 'user'); await putReceipt(r); showReview(); };
+  $('#btn-discard').onclick = async () => {
+    const r = state.cur;
+    if (r.status === 'confirmed' && !confirm('この控えを削除します。Drive上の画像も次回同期時に削除されます。よろしいですか？')) return;
+    await logHistory(r.id, 'status', r.status, 'void', 'user');
+    r.status = 'void'; r.pendingDriveDelete = !!r.driveFileId;
+    await idb.del('images', r.id);
+    await putReceipt(r); showReview();
+  };
   $('#l-month').onchange = renderList; $('#l-entity').onchange = renderList;
   $('#btn-drive').onclick = drive.connect;
   $('#btn-sync').onclick = async () => {
     if (!drive.token()) return alert('先にDriveに接続してください');
     $('#btn-sync').disabled = true;
-    try { const n = await drive.sync(); alert(`同期しました（画像 ${n} 枚アップロード）`); }
+    try { const { n, d } = await drive.sync(); alert(`同期しました（アップロード ${n} 枚${d ? '、削除 ' + d + ' 枚' : ''}）`); }
     catch (e) { if (String(e).includes('401')) { sessionStorage.removeItem('gtoken'); alert('Driveの接続が切れました。もう一度接続してください'); } else alert('同期エラー: ' + e.message); }
     $('#btn-sync').disabled = false; renderSettings();
   };
